@@ -15,6 +15,7 @@ Evolving Assistant is a self-modifying AI assistant designed to dynamically adap
 
 - Python 3.8 or higher
 - Required Python libraries:
+pip install...
   - `g4f` ([GPT4Free](https://github.com/xtekky/gpt4free) Concept client xTekky)
   - `asyncio`
   - `platform`
@@ -24,5 +25,5 @@ Evolving Assistant is a self-modifying AI assistant designed to dynamically adap
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/evolving-assistant.git
+   git clone https://github.com/Rez4nn/evolving-assistant.git
    cd evolving-assistant
