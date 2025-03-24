@@ -8,6 +8,7 @@ import asyncio
 import platform
 import logging  # Added for conversation history logging
 import time  # Added for timeout handling
+from difflib import SequenceMatcher  # Added for similarity checking
 
 # Suppress the specific RuntimeWarning related to Proactor event loop
 warnings.filterwarnings("ignore", message="Proactor event loop does not implement add_reader")
@@ -41,23 +42,28 @@ class SelfModifyingAI:
         logging.info(f"{self.config['ai_name']} initialized.")
 
     def ensure_commands_folder(self):
-        if not os.path.exists(COMMANDS_FOLDER):
-            os.makedirs(COMMANDS_FOLDER)
+        """
+        Ensure the commands folder exists.
+        """
+        commands_folder_path = os.path.join(os.getcwd(), COMMANDS_FOLDER)
+        if not os.path.exists(commands_folder_path):
+            os.makedirs(commands_folder_path)
     
     def load_config(self):
         """
         Load AI configuration from the config file. If the file doesn't exist, create a default one.
         """
-        if not os.path.exists(CONFIG_FILE):
+        config_path = os.path.join(os.getcwd(), CONFIG_FILE)
+        if not os.path.exists(config_path):
             default_config = {
                 "ai_name": "Assistant",
                 "behavior": "helpful and friendly",
                 "personality": "curious and engaging",
-                "apis": {}  # Store API details here
+                "apis": {}
             }
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=4)
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
 
     def update_config_with_api(self, api_name, api_details):
@@ -72,9 +78,13 @@ class SelfModifyingAI:
         print(f"API '{api_name}' has been added to the configuration.")
     
     def load_commands(self):
+        """
+        Load all commands from the commands folder.
+        """
+        commands_folder_path = os.path.join(os.getcwd(), COMMANDS_FOLDER)
         self.commands = {}
-        for category in os.listdir(COMMANDS_FOLDER):
-            category_path = os.path.join(COMMANDS_FOLDER, category)
+        for category in os.listdir(commands_folder_path):
+            category_path = os.path.join(commands_folder_path, category)
             if os.path.isdir(category_path):
                 self.commands[category] = {}
                 for fname in os.listdir(category_path):
@@ -100,8 +110,7 @@ class SelfModifyingAI:
     def classify_and_suggest(self, text):
         """
         Analyze the user input and determine if it is a conversation or command request.
-        If you don't know something like the time, date, weather, etc., then it is a command.
-        Return either, "command" or "conversation".
+        If it's a command request, suggest an appropriate command name and category.
         """
         # Check if the input matches an existing command
         sanitized_name = self.sanitize_command_name(text)
@@ -111,7 +120,7 @@ class SelfModifyingAI:
 
         # Check for real-time-related or action-related keywords to classify as a command
         real_time_keywords = ["time", "date", "weather", "temperature"]
-        action_keywords = ["open", "launch", "start"]
+        action_keywords = ["open", "launch", "start", "resume", "play", "stop", "pause"]
         for keyword in real_time_keywords:
             if keyword in text.lower():
                 return "utilities", self.sanitize_command_name(f"tell_the_{keyword}")
@@ -121,17 +130,17 @@ class SelfModifyingAI:
                 return "actions", self.sanitize_command_name(f"{keyword}_{action_object}")
 
         # If no match, proceed with GPT classification
-        prompt = (f"Analyze the following user input: '{text}'\n"
-                "If this is a command request (e.g., for retrieving time, date, weather, opening applications, etc.), "
-                "suggest an appropriate command name and category in lowercase with underscores (e.g., category: utilities, command: tell_the_time; "
-                "category: actions, command: open_spotify). "
-                "If it is general conversation, respond with 'conversation'.")
+        prompt = (f"Summarize the following user input: '{text}'\n"
+                  "Determine if it is a command request (e.g., retrieving time, date, weather, controlling applications, etc.) "
+                  "or general conversation. If it is a command request, suggest a concise command name and category in lowercase "
+                  "with underscores (e.g., category: utilities, command: tell_the_time; category: actions, command: resume_music). "
+                  "If it is general conversation, respond with 'conversation'.")
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 web_search=False,
-                timeout=10  # Added timeout to prevent hanging
+                timeout=10  # Prevent hanging
             )
             result = response.choices[0].message.content.strip().lower()
             if result == "conversation":
@@ -145,86 +154,99 @@ class SelfModifyingAI:
         except Exception as e:
             print(f"Error during GPT classification: {e}")
             return "conversation", None  # Default to conversation if GPT call fails
-        
+
     def detect_os(self):
         system = platform.system()
 
+    def find_similar_command(self, category, command_name, user_input):
+        """
+        Check if a similar command already exists in the specified category.
+        If a similar command is found, return its name; otherwise, return None.
+        """
+        if category in self.commands:
+            for existing_command, details in self.commands[category].items():
+                # Compare the user input with the existing command's name and code
+                name_similarity = SequenceMatcher(None, command_name, existing_command).ratio()
+                input_similarity = SequenceMatcher(None, user_input, details["code"]).ratio()
+
+                # Adjusted similarity threshold to reduce false positives
+                if name_similarity > 0.9 or input_similarity > 0.9:
+                    print(f"Found similar command '{existing_command}' in category '{category}'. Reusing it.")
+                    return existing_command
+        return None
+
+    def sanitize_path_component(self, text):
+        """
+        Sanitize a string to make it safe for use as a file or directory name.
+        """
+        return re.sub(r'[<>:"/\\|?*]', '', text)
+
     def create_command(self, category, command_name, user_input):
-        category_folder = os.path.join(COMMANDS_FOLDER, category)
+        """
+        Create a new command dynamically based on the user's input.
+        If a similar command already exists, reuse it.
+        """
+        # Sanitize category and command_name
+        category = self.sanitize_path_component(category)
+        command_name = self.sanitize_path_component(command_name)
+
+        commands_folder_path = os.path.join(os.getcwd(), COMMANDS_FOLDER)
+        category_folder = os.path.join(commands_folder_path, category)
         if not os.path.exists(category_folder):
             os.makedirs(category_folder)
-        
+
+        # Check for similar commands
+        similar_command = self.find_similar_command(category, command_name, user_input)
+        if similar_command:
+            return similar_command  # Reuse the similar command
+
         target_file = os.path.join(category_folder, f"{command_name}.py")
         if os.path.exists(target_file):
             print(f"Command '{command_name}' already exists in category '{category}'. Using existing command.")
-            return
+            return command_name
 
-        # Include OS information and API handling in the prompt for command creation
+        # Enhanced GPT prompt for dynamic command creation with configuration variables
         prompt = (f"Create a Python function named '{command_name}' based on the following request: '{user_input}'.\n"
-                  f"The current operating system is '{self.os_info}'. Optimize the function for this OS if relevant and make it universal.\n"
-                  "Ensure valid Python syntax and that the function returns a string result. "
-                  "Examples: If the request is to tell the time, create a function that returns the current time.\n"
-                  "Examples: If the request is to open an application (e.g., Spotify), create a function that launches the application using the appropriate system command.\n"
-                  "Examples: If an API is needed, provide a basic implementation to retrieve the required information using a free API.\n"
-                  "If an API is required, include a comment with instructions on how to obtain the API key and update the configuration file.\n"
-                  "Make sure to include any necessary imports and handle exceptions if needed and file directories should be dynamic, not hardcoded.\n"
+                  f"The current operating system is '{self.os_info}'. Optimize the function for this OS and make it universal where possible.\n"
+                  "Ensure valid Python syntax and that the function returns a string result.\n"
+                  "At the top of the file, include a section for variables that can be edited by the user to configure the function.\n"
+                  "For example, include variables for API keys, endpoints, or other configurable parameters.\n"
+                  "The function must:\n"
+                  "- Use the variables defined at the top of the file for configuration.\n"
+                  "- Include proper error handling for any external calls or operations.\n"
+                  "- Provide meaningful error messages to the user if something goes wrong.\n"
+                  "- Avoid hardcoding sensitive information like API keys or tokens and avoid them if you can.\n"
+                  "Handle platform-specific commands for Windows, macOS, and Linux first, use APIs as a fallback.\n"
+                  "Avoid hardcoding file paths; use dynamic paths to ensure compatibility across different environments.\n"
                   "Do not include any explanations; only return the valid code.")
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                web_search=False
+                web_search=True
             )
             new_code_segment = response.choices[0].message.content.strip()
             if '```' in new_code_segment:
                 parts = new_code_segment.split('```')
                 new_code_segment = next((part.replace('python', '').strip() for part in parts if 'def ' in part), new_code_segment)
 
-            # Check if a similar command already exists
-            for existing_category, commands in self.commands.items():
-                for existing_command, details in commands.items():
-                    if details["code"].strip() == new_code_segment.strip():
-                        print(f"Reusing existing command '{existing_command}' in category '{existing_category}'.")
-                        return
-
             # Write the new command to a file
             with open(target_file, "w", encoding="utf-8") as f:
                 f.write(new_code_segment)
             print(f"Command '{command_name}' has been created in category '{category}'.")
             self.load_commands()
-
-            # Check if the generated code mentions an API and update the config
-            if "API" in new_code_segment or "api" in new_code_segment:
-                api_name = command_name
-                api_details = f"# Instructions: Obtain a free API key for '{command_name}' and update the configuration file."
-                self.update_config_with_api(api_name, api_details)
         except Exception as e:
             print(f"Failed to create command '{command_name}': {e}")
-            # Fallback: Create basic functions for common commands if GPT fails
-            if command_name == "tell_the_time":
-                fallback_code = (
-                    "def tell_the_time():\n"
-                    "    from datetime import datetime\n"
-                    "    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')\n"
-                )
-            elif command_name == "open_spotify":
-                fallback_code = (
-                    "def open_spotify():\n"
-                    "    import os\n"
-                    "    os.system('spotify')\n"
-                    "    return 'Spotify has been opened.'\n"
-                )
-            else:
-                fallback_code = f"def {command_name}():\n    return 'Fallback: Command not implemented.'\n"
-            with open(target_file, "w", encoding="utf-8") as f:
-                f.write(fallback_code)
-            print(f"Fallback: Command '{command_name}' has been created in category '{category}'.")
-            self.load_commands()
+
+        return command_name
 
     def execute_command(self, category, command, *args):
+        """
+        Execute a command from the specified category.
+        If the command is missing, return an appropriate error message.
+        """
         if category in self.commands and command in self.commands[category]:
             try:
-                # Prevent repeated execution of the same command
                 print(f"Executing command '{command}' in category '{category}'...")
                 start_time = time.time()
                 result = self.commands[category][command]["function"](*args)
@@ -235,31 +257,31 @@ class SelfModifyingAI:
             except Exception as e:
                 return f"Error executing command '{command}' in category '{category}': {e}"
         else:
-            # Fallback: Handle "tell the time" directly if the command is missing
-            if command == "tell_the_time":
-                from datetime import datetime
-                return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             return f"Unknown command: {command} in category: {category}"
     
     def combine_results(self, command_output, user_input):
         """
-        3rd GPT call: Generate a final response based on user input and command output.
-        Uses conversation history from the log file for context.
+        Generate a concise response based on user input and command output.
+        Retain only important conversation history, excluding command executions but keeping command creation.
         """
         # Read the conversation history from the log file
         try:
             with open(self.log_file, "r", encoding="utf-8", errors="replace") as log:
-                history_text = log.read()
+                history_lines = log.readlines()
+                # Filter history to retain only important entries (e.g., command creation)
+                filtered_history = [line for line in history_lines if "created command" in line.lower()]
+                history_text = "".join(filtered_history)
         except FileNotFoundError:
             history_text = "No previous conversation history available."
 
-        prompt = (f"Conversation History:\n{history_text}\n"
+        prompt = (f"Be concise and keep your response short.\n"
+                  f"Conversation History:\n{history_text}\n"
                   f"User input: {user_input}\n"
                   f"Command output: {command_output}\n"
                   f"AI Name: {self.config['ai_name']}\n"
                   f"AI Behavior: {self.config['behavior']}\n"
                   f"AI Personality: {self.config['personality']}\n"
-                  "Generate a final response to the user based on this information.")
+                  "Generate a concise and summarized response to the user based on this information.")
         
         response = self.client.chat.completions.create(
             model="gpt-4o-mini",
@@ -270,8 +292,8 @@ class SelfModifyingAI:
     
     def evolve(self, user_input):
         if not user_input.strip():
-            print("No input given. Evolution cancelled.")
-            return
+            logging.info("No input given. Evolution cancelled.")
+            return "No input given. Please try again."
         
         logging.info(f"User: {user_input}")  # Log user input
         category, decision = self.classify_and_suggest(user_input)
@@ -285,14 +307,15 @@ class SelfModifyingAI:
             command_name = self.sanitize_command_name(decision)
             if category not in self.commands or command_name not in self.commands[category]:
                 self.create_command(category, command_name, user_input)
+                logging.info(f"Created command: {command_name} in category: {category}")  # Log command creation
             command_output = self.execute_command(category, command_name)
             final_response = self.combine_results(command_output, user_input)
         
         logging.info(f"AI: {final_response}")  # Log AI response
-        print(f"{self.config['ai_name']} Response:", final_response)
+        return final_response  # Ensure the response is returned for GUI
 
 if __name__ == "__main__":
+    from gui import run_gui  # Import the GUI function
+
     ai = SelfModifyingAI()
-    while True:
-        user_input = input(f"{ai.config['ai_name']}: Enter a command or request: ")
-        ai.evolve(user_input)
+    run_gui(ai)  # Launch the GUI
